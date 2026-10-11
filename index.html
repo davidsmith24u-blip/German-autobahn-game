@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Autobahn Unlimited</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif;overflow:hidden}
+  canvas{display:block;width:100%;height:100%}
+  #menu{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.8);text-align:center}
+  #menu h1{margin:0 0 4px;font-size:2.4em;letter-spacing:.1em}
+  #menu p{color:#bbb;margin:4px}
+  #cars{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin:16px}
+  .car{border:2px solid #444;border-radius:8px;padding:10px 14px;cursor:pointer;min-width:150px;background:#111}
+  .car.sel{border-color:#ffcc00;background:#222}
+  .car b{display:block;font-size:1.1em}
+  .sw{display:inline-block;width:14px;height:14px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  button{font-size:1.2em;padding:10px 28px;border:0;border-radius:6px;background:#ffcc00;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="menu">
+  <h1>AUTOBAHN UNLIMITED</h1>
+  <p>Straight. Empty. No speed limit. Max it out.</p>
+  <div id="cars"></div>
+  <button id="go">START ENGINE</button>
+  <p>↑ / W throttle &nbsp; ↓ / S brake &nbsp; ← → / A D steer &nbsp; Space: nitro-free launch &nbsp; Touch: tap left/right, top = gas, bottom = brake</p>
+</div>
+<script>
+"use strict";
+const CARS = [
+  {name:"Bugatti Chiron Super Sport", top:490, acc:95, color:"#1f4fd8"},
+  {name:"Koenigsegg Jesko Absolut",   top:531, acc:110, color:"#e8e8e8"},
+  {name:"Lamborghini Revuelto",       top:350, acc:140, color:"#ffcc00"},
+  {name:"Ferrari SF90 Stradale",      top:340, acc:150, color:"#d81920"},
+  {name:"McLaren Speedtail",          top:403, acc:120, color:"#ff7a00"},
+  {name:"Pagani Huayra",              top:370, acc:125, color:"#555b66"}
+];
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+let W, H;
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
+addEventListener("resize", resize); resize();
+
+// menu
+let sel = 0;
+const carsEl = document.getElementById("cars");
+CARS.forEach((c,i)=>{
+  const d = document.createElement("div");
+  d.className = "car" + (i===0?" sel":"");
+  d.innerHTML = `<b><span class="sw" style="background:${c.color}"></span>${c.name}</b>Top ${c.top} km/h`;
+  d.onclick = ()=>{ sel=i; [...carsEl.children].forEach((e,j)=>e.classList.toggle("sel",j===i)); };
+  carsEl.appendChild(d);
+});
+
+// game state
+const SEG = 200, DRAW = 150, ROAD_W = 2000, LANES = 3;
+let running = false, car, pos, speed, x, odo, traffic, best = 0, crashT = 0, time, maxSpeed;
+const keys = {};
+addEventListener("keydown", e=>{ keys[e.key.toLowerCase()] = true; if(e.key.startsWith("Arrow")) e.preventDefault(); });
+addEventListener("keyup", e=>{ keys[e.key.toLowerCase()] = false; });
+const touch = {l:false,r:false,g:false,b:false};
+function touchUpdate(e){
+  touch.l=touch.r=touch.g=touch.b=false;
+  for(const t of e.touches){
+    if(t.clientX < W/3) touch.l = true; else if(t.clientX > W*2/3) touch.r = true;
+    if(t.clientY < H/2) touch.g = true; else touch.b = true;
+  }
+  e.preventDefault();
+}
+["touchstart","touchmove","touchend","touchcancel"].forEach(n=>cv.addEventListener(n,touchUpdate,{passive:false}));
+
+function start(){
+  car = CARS[sel]; pos = 0; speed = 0; x = 0; odo = 0; time = 0; maxSpeed = 0; crashT = 0;
+  traffic = [];
+  for(let i=0;i<25;i++) spawn(2000 + i*3000 + Math.random()*2000);
+  running = true;
+  document.getElementById("menu").style.display = "none";
+}
+function spawn(z){
+  traffic.push({z, lane: Math.floor(Math.random()*LANES), v: (100 + Math.random()*60)/3.6*100, // cm-ish units/s
+    color: ["#888","#ccc","#335","#733","#363"][Math.floor(Math.random()*5)]});
+}
+document.getElementById("go").onclick = start;
+addEventListener("keydown", e=>{ if(!running && e.key==="Enter") start(); });
+
+const laneX = l => (l - (LANES-1)/2) * (ROAD_W*2/3/LANES*1.0) / (ROAD_W/2); // -0.67..0.67 of half width
+// units: world z in "cm", speed km/h => 1 km/h = 27.78 cm/s * scale
+const KMH = 27.78 * 3;
+
+function update(dt){
+  if(!running) return;
+  const left = keys.arrowleft||keys.a||touch.l, right = keys.arrowright||keys.d||touch.r;
+  const gas = keys.arrowup||keys.w||keys[" "]||touch.g, brake = keys.arrowdown||keys.s||touch.b;
+  if(crashT > 0){ crashT -= dt; speed = Math.max(0, speed - 250*dt); }
+  else if(gas){
+    // acceleration tapers as drag grows, so the last km/h is hard-earned
+    const f = 1 - Math.pow(speed/car.top, 2);
+    speed += car.acc * Math.max(f,0.02) * dt;
+    speed = Math.min(speed, car.top);
+  } else speed = Math.max(0, speed - 12*dt);
+  if(brake) speed = Math.max(0, speed - 200*dt);
+  const steer = (right?1:0) - (left?1:0);
+  x += steer * dt * (0.6 + speed/car.top*0.9) * (speed>5?1:0);
+  if(Math.abs(x) > 1.15){ x = Math.sign(x)*1.15; speed = Math.max(0, speed - 150*dt); } // grass drag
+  pos += speed*KMH*dt;
+  odo += speed/3600*dt;
+  time += dt;
+  maxSpeed = Math.max(maxSpeed, speed);
+  best = Math.max(best, maxSpeed);
+
+  // traffic: only slow trucks/cars in the right lanes; recycle ones we pass
+  for(const t of traffic){
+    t.z += t.v*dt;
+    if(t.z < pos - 3000){ t.z = pos + 60000 + Math.random()*20000; t.lane = Math.floor(Math.random()*LANES);
+      t.v = (90 + Math.random()*70)/3.6*100; }
+    const dz = t.z - pos, dx = Math.abs(laneX(t.lane) - x);
+    if(crashT<=0 && dz > -400 && dz < 600 && dx < 0.28){
+      crashT = 1.5; speed *= 0.35; x += (x<laneX(t.lane)?-1:1)*0.2;
+    }
+  }
+}
+
+function project(wx, wz){ // world lateral (-1..1 of half road), distance cm -> screen
+  const k = 900 / Math.max(wz, 50);
+  return {x: W/2 + wx*(ROAD_W/2)*k*(W/1280)*0.5 , y: H*0.45 + 1500*k*(H/720)*0.35, s: k};
+}
+
+function draw(){
+  const sp = speed/car.top;
+  // sky
+  const g = ctx.createLinearGradient(0,0,0,H*0.45);
+  g.addColorStop(0,"#3a7bd5"); g.addColorStop(1,"#cfe8ff");
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H*0.45);
+  ctx.fillStyle = "#3d7a2f"; ctx.fillRect(0,H*0.45,W,H*0.55);
+  // distant tree line / hills
+  ctx.fillStyle = "#2a5a24";
+  for(let i=0;i<40;i++){ const hx=i*W/38, hh=8+((i*37)%13); ctx.fillRect(hx,H*0.45-hh,W/38+1,hh); }
+
+  const camPos = pos;
+  // road strips
+  for(let n=DRAW; n>0; n--){
+    const z1 = n*SEG*2 + (SEG*2 - camPos % (SEG*2)), z0 = z1 - SEG*2;
+    const idx = Math.floor((camPos + z1)/(SEG*2));
+    const a = project(0, z0), b = project(0, z1);
+    const halfA = ROAD_W/2*a.s*(W/1280)*0.5, halfB = ROAD_W/2*b.s*(W/1280)*0.5;
+    const cx = W/2 - x*halfA, cxb = W/2 - x*halfB;
+    if(a.y < H*0.45) continue;
+    const alt = idx%2===0;
+    ctx.fillStyle = alt ? "#3d7a2f" : "#377128";
+    ctx.fillRect(0, b.y, W, a.y-b.y+1);
+    quad(cxb,b.y,halfB*1.08, cx,a.y,halfA*1.08, alt?"#ddd":"#c33");
+    quad(cxb,b.y,halfB, cx,a.y,halfA, alt?"#4a4a4f":"#47474c");
+    if(alt){
+      for(let l=1;l<LANES;l++){
+        const off = (l/LANES*2-1);
+        quad(cxb+off*halfB,b.y,halfB*0.012, cx+off*halfA,a.y,halfA*0.012, "#eee");
+      }
+    }
+    // roadside posts
+    if(idx%4===0){
+      quad(cxb-halfB*1.2,b.y,halfB*0.015, cx-halfA*1.2,a.y,halfA*0.015, "#fff");
+      quad(cxb+halfB*1.2,b.y,halfB*0.015, cx+halfA*1.2,a.y,halfA*0.015, "#fff");
+    }
+  }
+  // traffic, far to near
+  const vis = traffic.filter(t=>t.z-pos>100 && t.z-pos<DRAW*SEG*2).sort((p,q)=>q.z-p.z);
+  for(const t of vis){
+    const p = project(0, t.z-pos), half = ROAD_W/2*p.s*(W/1280)*0.5;
+    drawCar(W/2 + (laneX(t.lane)-x)*half, p.y, half*0.22, t.color, false);
+  }
+  // player
+  const shake = speed>car.top*0.8 ? (Math.random()-.5)*speed/car.top*3 : 0;
+  const tilt = crashT>0 ? Math.sin(crashT*30)*10 : 0;
+  drawCar(W/2 + shake + tilt, H*0.86, Math.min(W,H*1.6)*0.12, car.color, true);
+
+  // speed lines
+  if(sp > 0.55){
+    ctx.strokeStyle = `rgba(255,255,255,${(sp-0.55)*0.6})`; ctx.lineWidth = 2;
+    for(let i=0;i<30;i++){
+      const a = Math.random()*Math.PI*2, r1 = Math.min(W,H)*(0.35+Math.random()*0.2), r2 = r1*(1.3+sp*0.5);
+      ctx.beginPath();
+      ctx.moveTo(W/2+Math.cos(a)*r1, H*0.5+Math.sin(a)*r1*0.8);
+      ctx.lineTo(W/2+Math.cos(a)*r2, H*0.5+Math.sin(a)*r2*0.8); ctx.stroke();
+    }
+  }
+  // HUD
+  ctx.fillStyle = "#fff"; ctx.textAlign = "left";
+  ctx.font = "bold " + Math.round(H*0.12) + "px monospace";
+  ctx.fillText(Math.round(speed), 24, H*0.14);
+  ctx.font = Math.round(H*0.03) + "px monospace";
+  ctx.fillText("km/h   " + car.name, 24, H*0.14 + H*0.04);
+  ctx.fillText("Distance " + odo.toFixed(2) + " km   Max " + Math.round(maxSpeed) + "   Best " + Math.round(best), 24, H*0.14 + H*0.08);
+  ctx.fillText("Time " + time.toFixed(0) + "s", 24, H*0.14 + H*0.12);
+  // speed bar
+  ctx.fillStyle = "#333"; ctx.fillRect(24, H*0.30, W*0.25, 10);
+  ctx.fillStyle = sp>0.95 ? "#f33" : "#ffcc00"; ctx.fillRect(24, H*0.30, W*0.25*sp, 10);
+  if(sp > 0.98){ ctx.textAlign="center"; ctx.fillStyle="#f33"; ctx.font="bold "+Math.round(H*0.06)+"px monospace"; ctx.fillText("MAXED OUT!", W/2, H*0.2); }
+  if(crashT > 0){ ctx.textAlign="center"; ctx.fillStyle="#f33"; ctx.font="bold "+Math.round(H*0.06)+"px monospace"; ctx.fillText("COLLISION!", W/2, H*0.3); }
+}
+function quad(cx1,y1,h1,cx2,y2,h2,col){
+  ctx.fillStyle = col; ctx.beginPath();
+  ctx.moveTo(cx1-h1,y1); ctx.lineTo(cx1+h1,y1); ctx.lineTo(cx2+h2,y2); ctx.lineTo(cx2-h2,y2); ctx.closePath(); ctx.fill();
+}
+function drawCar(cx, by, w, col, player){
+  const h = w*0.5;
+  ctx.fillStyle = "rgba(0,0,0,.4)"; ctx.fillRect(cx-w*0.55, by-h*0.1, w*1.1, h*0.15);
+  ctx.fillStyle = col; ctx.fillRect(cx-w/2, by-h*0.55, w, h*0.5);
+  ctx.fillStyle = shade(col); ctx.fillRect(cx-w*0.38, by-h, w*0.76, h*0.5);
+  ctx.fillStyle = "#101820"; ctx.fillRect(cx-w*0.32, by-h*0.93, w*0.64, h*0.3);
+  ctx.fillStyle = "#111"; ctx.fillRect(cx-w*0.55, by-h*0.3, w*0.14, h*0.3); ctx.fillRect(cx+w*0.41, by-h*0.3, w*0.14, h*0.3);
+  ctx.fillStyle = (player && keys.arrowdown) || (player && keys.s) ? "#ff0000" : "#a00";
+  ctx.fillRect(cx-w*0.46, by-h*0.45, w*0.2, h*0.1); ctx.fillRect(cx+w*0.26, by-h*0.45, w*0.2, h*0.1);
+}
+function shade(c){
+  const n = parseInt(c.slice(1),16);
+  const f = v=>Math.max(0,Math.min(255,v-30));
+  return `rgb(${f(n>>16)},${f((n>>8)&255)},${f(n&255)})`;
+}
+
+let last = performance.now();
+function loop(t){
+  const dt = Math.min(0.05, (t-last)/1000); last = t;
+  update(dt);
+  if(running) draw(); else { ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
